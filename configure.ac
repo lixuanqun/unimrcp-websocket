@@ -207,6 +207,11 @@ UNI_PLUGIN_ENABLED(recorder)
 
 AM_CONDITIONAL([RECORDER_PLUGIN],[test "${enable_recorder_plugin}" = "yes"])
 
+dnl WebSocket recognizer plugin.
+UNI_PLUGIN_ENABLED(websocketrecog)
+
+AM_CONDITIONAL([WEBSOCKETRECOG_PLUGIN],[test "${enable_websocketrecog_plugin}" = "yes"])
+
 dnl Enable test suites.
 AC_ARG_ENABLE(test-suites,
     [AC_HELP_STRING([--enable-test-suites  ],[build test suites])],
@@ -294,6 +299,7 @@ echo Demo synthesizer plugin....... : $enable_demosynth_plugin
 echo Demo recognizer plugin........ : $enable_demorecog_plugin
 echo Demo verifier plugin.......... : $enable_demoverifier_plugin
 echo Recorder plugin............... : $enable_recorder_plugin
+echo WebSocket recognizer plugin... : $enable_websocketrecog_plugin
 echo
 echo Installation layout........... : $layout_name
 echo Installation directory........ : $prefix

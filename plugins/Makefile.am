@@ -17,3 +17,7 @@ endif
 if RECORDER_PLUGIN
 SUBDIRS               += mrcp-recorder
 endif
+
+if WEBSOCKETRECOG_PLUGIN
+SUBDIRS               += websocket-recog
+endif

@@ -125,6 +125,12 @@
       <engine id="Demo-Recog-1" name="demorecog" enable="true"/>
       <engine id="Demo-Verifier-1" name="demoverifier" enable="true"/>
       <engine id="Recorder-1" name="mrcprecorder" enable="true"/>
+      <engine id="WebSocket-Recog-1" name="websocketrecog" enable="true">
+        <max-channel-count>100</max-channel-count>
+        <param name="ws-host" value="localhost"/>
+        <param name="ws-port" value="8080"/>
+        <param name="ws-path" value="/asr"/>
+      </engine>
 
       <!--
         Engines may have additional named ("max-channel-count") and generic (name/value) parameters.
