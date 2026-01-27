@@ -239,6 +239,7 @@ AC_CONFIG_FILES([
     libs/mrcp-server/Makefile
     libs/mrcp-client/Makefile
     libs/uni-rtsp/Makefile
+    libs/websocket-client/Makefile
     modules/Makefile
     modules/mrcp-sofiasip/Makefile
     modules/mrcp-unirtsp/Makefile
@@ -248,6 +249,7 @@ AC_CONFIG_FILES([
     plugins/demo-recog/Makefile
     plugins/demo-verifier/Makefile
     plugins/websocket-synth/Makefile
+    plugins/websocket-recog/Makefile
     platforms/Makefile
     platforms/libunimrcp-server/Makefile
     platforms/libunimrcp-client/Makefile

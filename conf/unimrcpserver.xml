@@ -130,12 +130,16 @@
         <param name="ws-host" value="localhost"/>
         <param name="ws-port" value="8080"/>
         <param name="ws-path" value="/asr"/>
+        <!-- Enable streaming mode for real-time audio transmission -->
+        <param name="streaming" value="false"/>
       </engine>
       <engine id="WebSocket-Synth-1" name="websocketsynth" enable="true">
         <max-channel-count>100</max-channel-count>
         <param name="ws-host" value="localhost"/>
         <param name="ws-port" value="8080"/>
         <param name="ws-path" value="/tts"/>
+        <!-- Maximum audio buffer size in bytes (default: 2MB) -->
+        <param name="max-audio-size" value="2097152"/>
       </engine>
 
       <!--

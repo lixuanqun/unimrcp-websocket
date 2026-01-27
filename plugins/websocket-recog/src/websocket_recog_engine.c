@@ -31,939 +31,872 @@
 #include "mpf_activity_detector.h"
 #include "apt_consumer_task.h"
 #include "apt_log.h"
+#include "ws_client.h"
 #include <apr_strings.h>
-#include <apr_network_io.h>
-#include <apr_base64.h>
-#include <apr_time.h>
-#include <apr_uuid.h>
+#include <apr_thread_mutex.h>
 #include <string.h>
 
 #define WEBSOCKET_RECOG_ENGINE_TASK_NAME "WebSocket Recog Engine"
 
+/*******************************************************************************
+ * Configuration Constants
+ ******************************************************************************/
+
+/** Audio buffer configuration */
+#define AUDIO_BUFFER_SIZE       (512 * 1024)    /* 512KB buffer (~16 seconds @ 8kHz) */
+#define STREAM_CHUNK_SIZE       (3200)          /* 200ms chunks for streaming */
+
+/** Timing configuration */
+#define RECV_POLL_INTERVAL      (50000)         /* 50ms polling interval */
+#define MAX_RECOGNIZE_DURATION  (60 * 1000000)  /* 60 seconds max */
+
+/*******************************************************************************
+ * Type Definitions
+ ******************************************************************************/
+
 typedef struct websocket_recog_engine_t websocket_recog_engine_t;
 typedef struct websocket_recog_channel_t websocket_recog_channel_t;
 typedef struct websocket_recog_msg_t websocket_recog_msg_t;
-typedef struct websocket_client_t websocket_client_t;
 
-/** WebSocket client structure */
-struct websocket_client_t {
-	apr_socket_t *socket;
-	apr_sockaddr_t *sa;
-	apr_pool_t *pool;
-	apt_bool_t connected;
-	char *host;
-	int port;
-	char *path;
+/** Message types for background task */
+typedef enum {
+    WEBSOCKET_RECOG_MSG_OPEN_CHANNEL,
+    WEBSOCKET_RECOG_MSG_CLOSE_CHANNEL,
+    WEBSOCKET_RECOG_MSG_REQUEST_PROCESS,
+    WEBSOCKET_RECOG_MSG_SEND_AUDIO,       /* Send buffered audio */
+    WEBSOCKET_RECOG_MSG_STREAM_AUDIO,     /* Stream audio chunk (real-time) */
+    WEBSOCKET_RECOG_MSG_RECV_RESULT       /* Poll for recognition result */
+} websocket_recog_msg_type_e;
+
+/** Declaration of websocket recognizer engine */
+struct websocket_recog_engine_t {
+    apt_consumer_task_t *task;
+    apr_pool_t *pool;
 };
 
-/** Declaration of recognizer engine methods */
+/** Declaration of websocket recognizer channel */
+struct websocket_recog_channel_t {
+    /** Back pointer to engine */
+    websocket_recog_engine_t *recog_engine;
+    /** Engine channel base */
+    mrcp_engine_channel_t    *channel;
+
+    /** Active (in-progress) recognition request */
+    mrcp_message_t           *recog_request;
+    /** Pending stop response */
+    mrcp_message_t           *stop_response;
+    /** Indicates whether input timers are started */
+    apt_bool_t                timers_started;
+    /** Voice activity detector */
+    mpf_activity_detector_t  *detector;
+    
+    /** WebSocket client */
+    ws_client_t              *ws_client;
+    
+    /** Audio buffer */
+    char                     *audio_buffer;
+    apr_size_t                audio_buffer_size;
+    apr_size_t                audio_buffer_pos;
+    
+    /** Streaming state */
+    apt_bool_t                streaming_enabled;
+    apt_bool_t                speech_started;
+    apt_bool_t                waiting_result;
+    apr_size_t                stream_pos;
+    
+    /** Mutex for thread safety */
+    apr_thread_mutex_t       *mutex;
+    
+    /** Timing */
+    apr_time_t                recognize_start_time;
+};
+
+/** Declaration of websocket recognizer task message */
+struct websocket_recog_msg_t {
+    websocket_recog_msg_type_e type;
+    mrcp_engine_channel_t     *channel;
+    mrcp_message_t            *request;
+    const char                *audio_data;
+    apr_size_t                 audio_len;
+};
+
+/*******************************************************************************
+ * Function Declarations
+ ******************************************************************************/
+
+/** Engine methods */
 static apt_bool_t websocket_recog_engine_destroy(mrcp_engine_t *engine);
 static apt_bool_t websocket_recog_engine_open(mrcp_engine_t *engine);
 static apt_bool_t websocket_recog_engine_close(mrcp_engine_t *engine);
 static mrcp_engine_channel_t* websocket_recog_engine_channel_create(mrcp_engine_t *engine, apr_pool_t *pool);
 
 static const struct mrcp_engine_method_vtable_t engine_vtable = {
-	websocket_recog_engine_destroy,
-	websocket_recog_engine_open,
-	websocket_recog_engine_close,
-	websocket_recog_engine_channel_create
+    websocket_recog_engine_destroy,
+    websocket_recog_engine_open,
+    websocket_recog_engine_close,
+    websocket_recog_engine_channel_create
 };
 
-/** Declaration of recognizer channel methods */
+/** Channel methods */
 static apt_bool_t websocket_recog_channel_destroy(mrcp_engine_channel_t *channel);
 static apt_bool_t websocket_recog_channel_open(mrcp_engine_channel_t *channel);
 static apt_bool_t websocket_recog_channel_close(mrcp_engine_channel_t *channel);
 static apt_bool_t websocket_recog_channel_request_process(mrcp_engine_channel_t *channel, mrcp_message_t *request);
 
 static const struct mrcp_engine_channel_method_vtable_t channel_vtable = {
-	websocket_recog_channel_destroy,
-	websocket_recog_channel_open,
-	websocket_recog_channel_close,
-	websocket_recog_channel_request_process
+    websocket_recog_channel_destroy,
+    websocket_recog_channel_open,
+    websocket_recog_channel_close,
+    websocket_recog_channel_request_process
 };
 
-/** Declaration of recognizer audio stream methods */
+/** Audio stream methods */
 static apt_bool_t websocket_recog_stream_destroy(mpf_audio_stream_t *stream);
 static apt_bool_t websocket_recog_stream_open(mpf_audio_stream_t *stream, mpf_codec_t *codec);
 static apt_bool_t websocket_recog_stream_close(mpf_audio_stream_t *stream);
 static apt_bool_t websocket_recog_stream_write(mpf_audio_stream_t *stream, const mpf_frame_t *frame);
 
 static const mpf_audio_stream_vtable_t audio_stream_vtable = {
-	websocket_recog_stream_destroy,
-	NULL,
-	NULL,
-	NULL,
-	websocket_recog_stream_open,
-	websocket_recog_stream_close,
-	websocket_recog_stream_write,
-	NULL
+    websocket_recog_stream_destroy,
+    NULL, NULL, NULL,
+    websocket_recog_stream_open,
+    websocket_recog_stream_close,
+    websocket_recog_stream_write,
+    NULL
 };
 
-/** Declaration of websocket recognizer engine */
-struct websocket_recog_engine_t {
-	apt_consumer_task_t    *task;
-};
-
-/** Declaration of websocket recognizer channel */
-struct websocket_recog_channel_t {
-	/** Back pointer to engine */
-	websocket_recog_engine_t     *websocket_engine;
-	/** Engine channel base */
-	mrcp_engine_channel_t   *channel;
-
-	/** Active (in-progress) recognition request */
-	mrcp_message_t          *recog_request;
-	/** Pending stop response */
-	mrcp_message_t          *stop_response;
-	/** Indicates whether input timers are started */
-	apt_bool_t               timers_started;
-	/** Voice activity detector */
-	mpf_activity_detector_t *detector;
-	/** WebSocket client */
-	websocket_client_t      *ws_client;
-	/** Audio buffer for WebSocket transmission */
-	apr_size_t              audio_buffer_size;
-	char                   *audio_buffer;
-	apr_size_t              audio_buffer_pos;
-};
-
-typedef enum {
-	WEBSOCKET_RECOG_MSG_OPEN_CHANNEL,
-	WEBSOCKET_RECOG_MSG_CLOSE_CHANNEL,
-	WEBSOCKET_RECOG_MSG_REQUEST_PROCESS,
-	WEBSOCKET_RECOG_MSG_SEND_AUDIO  /* P1: Send audio data via background task */
-} websocket_recog_msg_type_e;
-
-/** Declaration of websocket recognizer task message */
-struct websocket_recog_msg_t {
-	websocket_recog_msg_type_e  type;
-	mrcp_engine_channel_t *channel; 
-	mrcp_message_t        *request;
-};
-
+/** Internal functions */
 static apt_bool_t websocket_recog_msg_signal(websocket_recog_msg_type_e type, mrcp_engine_channel_t *channel, mrcp_message_t *request);
+static apt_bool_t websocket_recog_msg_signal_audio(mrcp_engine_channel_t *channel, const char *data, apr_size_t len);
 static apt_bool_t websocket_recog_msg_process(apt_task_t *task, apt_task_msg_t *msg);
+static apt_bool_t websocket_recog_channel_request_dispatch(mrcp_engine_channel_t *channel, mrcp_message_t *request);
 
-/** WebSocket handshake and connection functions */
-static apt_bool_t websocket_client_connect(websocket_client_t *ws_client);
-static apt_bool_t websocket_client_send(websocket_client_t *ws_client, const char *data, apr_size_t len);
-static apt_bool_t websocket_client_receive(websocket_client_t *ws_client, char *buffer, apr_size_t *len);
-static void websocket_client_destroy(websocket_client_t *ws_client);
+/*******************************************************************************
+ * Plugin Declaration
+ ******************************************************************************/
 
-/** Declare this macro to set plugin version */
 MRCP_PLUGIN_VERSION_DECLARE
 
-/**
- * Declare this macro to use log routine of the server, plugin is loaded from.
- * Enable/add the corresponding entry in logger.xml to set a custom log source priority.
- *    <source name="WEBSOCKET-RECOG-PLUGIN" priority="DEBUG" masking="NONE"/>
- */
-MRCP_PLUGIN_LOG_SOURCE_IMPLEMENT(WEBSOCKET_RECOG_PLUGIN,"WEBSOCKET-RECOG-PLUGIN")
+MRCP_PLUGIN_LOG_SOURCE_IMPLEMENT(WEBSOCKET_RECOG_PLUGIN, "WEBSOCKET-RECOG-PLUGIN")
 
-/** Use custom log source mark */
-#define WEBSOCKET_RECOG_LOG_MARK   APT_LOG_MARK_DECLARE(WEBSOCKET_RECOG_PLUGIN)
+#define RECOG_LOG_MARK APT_LOG_MARK_DECLARE(WEBSOCKET_RECOG_PLUGIN)
 
-/** Create websocket recognizer engine */
+/*******************************************************************************
+ * Engine Implementation
+ ******************************************************************************/
+
 MRCP_PLUGIN_DECLARE(mrcp_engine_t*) mrcp_plugin_create(apr_pool_t *pool)
 {
-	websocket_recog_engine_t *websocket_engine = apr_palloc(pool,sizeof(websocket_recog_engine_t));
-	apt_task_t *task;
-	apt_task_vtable_t *vtable;
-	apt_task_msg_pool_t *msg_pool;
+    websocket_recog_engine_t *recog_engine;
+    apt_task_t *task;
+    apt_task_vtable_t *vtable;
+    apt_task_msg_pool_t *msg_pool;
 
-	msg_pool = apt_task_msg_pool_create_dynamic(sizeof(websocket_recog_msg_t),pool);
-	websocket_engine->task = apt_consumer_task_create(websocket_engine,msg_pool,pool);
-	if(!websocket_engine->task) {
-		return NULL;
-	}
-	task = apt_consumer_task_base_get(websocket_engine->task);
-	apt_task_name_set(task,WEBSOCKET_RECOG_ENGINE_TASK_NAME);
-	vtable = apt_task_vtable_get(task);
-	if(vtable) {
-		vtable->process_msg = websocket_recog_msg_process;
-	}
+    apt_log(RECOG_LOG_MARK, APT_PRIO_INFO, "Create WebSocket Recog Engine");
 
-	/* create engine base */
-	return mrcp_engine_create(
-				MRCP_RECOGNIZER_RESOURCE,  /* MRCP resource identifier */
-				websocket_engine,               /* object to associate */
-				&engine_vtable,            /* virtual methods table of engine */
-				pool);                     /* pool to allocate memory from */
+    recog_engine = apr_palloc(pool, sizeof(websocket_recog_engine_t));
+    if (!recog_engine) {
+        return NULL;
+    }
+    
+    recog_engine->pool = pool;
+
+    msg_pool = apt_task_msg_pool_create_dynamic(sizeof(websocket_recog_msg_t), pool);
+    recog_engine->task = apt_consumer_task_create(recog_engine, msg_pool, pool);
+    if (!recog_engine->task) {
+        return NULL;
+    }
+    
+    task = apt_consumer_task_base_get(recog_engine->task);
+    apt_task_name_set(task, WEBSOCKET_RECOG_ENGINE_TASK_NAME);
+    vtable = apt_task_vtable_get(task);
+    if (vtable) {
+        vtable->process_msg = websocket_recog_msg_process;
+    }
+
+    return mrcp_engine_create(
+        MRCP_RECOGNIZER_RESOURCE,
+        recog_engine,
+        &engine_vtable,
+        pool);
 }
 
-/** Destroy recognizer engine */
 static apt_bool_t websocket_recog_engine_destroy(mrcp_engine_t *engine)
 {
-	websocket_recog_engine_t *websocket_engine = engine->obj;
-	if(websocket_engine->task) {
-		apt_task_t *task = apt_consumer_task_base_get(websocket_engine->task);
-		apt_task_destroy(task);
-		websocket_engine->task = NULL;
-	}
-	return TRUE;
+    websocket_recog_engine_t *recog_engine = engine->obj;
+    apt_log(RECOG_LOG_MARK, APT_PRIO_INFO, "Destroy WebSocket Recog Engine");
+    
+    if (recog_engine->task) {
+        apt_task_t *task = apt_consumer_task_base_get(recog_engine->task);
+        apt_task_destroy(task);
+        recog_engine->task = NULL;
+    }
+    return TRUE;
 }
 
-/** Open recognizer engine */
 static apt_bool_t websocket_recog_engine_open(mrcp_engine_t *engine)
 {
-	websocket_recog_engine_t *websocket_engine = engine->obj;
-	if(websocket_engine->task) {
-		apt_task_t *task = apt_consumer_task_base_get(websocket_engine->task);
-		apt_task_start(task);
-	}
-	return mrcp_engine_open_respond(engine,TRUE);
+    websocket_recog_engine_t *recog_engine = engine->obj;
+    apt_log(RECOG_LOG_MARK, APT_PRIO_INFO, "Open WebSocket Recog Engine");
+    
+    if (recog_engine->task) {
+        apt_task_t *task = apt_consumer_task_base_get(recog_engine->task);
+        apt_task_start(task);
+    }
+    return mrcp_engine_open_respond(engine, TRUE);
 }
 
-/** Close recognizer engine */
 static apt_bool_t websocket_recog_engine_close(mrcp_engine_t *engine)
 {
-	websocket_recog_engine_t *websocket_engine = engine->obj;
-	if(websocket_engine->task) {
-		apt_task_t *task = apt_consumer_task_base_get(websocket_engine->task);
-		apt_task_terminate(task,TRUE);
-	}
-	return mrcp_engine_close_respond(engine);
+    websocket_recog_engine_t *recog_engine = engine->obj;
+    apt_log(RECOG_LOG_MARK, APT_PRIO_INFO, "Close WebSocket Recog Engine");
+    
+    if (recog_engine->task) {
+        apt_task_t *task = apt_consumer_task_base_get(recog_engine->task);
+        apt_task_terminate(task, TRUE);
+    }
+    return mrcp_engine_close_respond(engine);
 }
+
+/*******************************************************************************
+ * Channel Implementation
+ ******************************************************************************/
 
 static mrcp_engine_channel_t* websocket_recog_engine_channel_create(mrcp_engine_t *engine, apr_pool_t *pool)
 {
-	mpf_stream_capabilities_t *capabilities;
-	mpf_termination_t *termination; 
-	const char *ws_host;
-	const char *ws_port_str;
-	const char *ws_path;
-	int ws_port;
+    mpf_stream_capabilities_t *capabilities;
+    mpf_termination_t *termination;
+    websocket_recog_channel_t *recog_channel;
+    ws_client_config_t ws_config;
+    const char *ws_host;
+    const char *ws_port_str;
+    const char *ws_path;
+    const char *streaming_str;
 
-	/* create websocket recog channel */
-	websocket_recog_channel_t *recog_channel = apr_palloc(pool,sizeof(websocket_recog_channel_t));
-	recog_channel->websocket_engine = engine->obj;
-	recog_channel->recog_request = NULL;
-	recog_channel->stop_response = NULL;
-	recog_channel->timers_started = FALSE;
-	recog_channel->detector = mpf_activity_detector_create(pool);
-	recog_channel->ws_client = NULL;
-	recog_channel->audio_buffer = NULL;
-	recog_channel->audio_buffer_size = 0;
-	recog_channel->audio_buffer_pos = 0;
+    apt_log(RECOG_LOG_MARK, APT_PRIO_INFO, "Create WebSocket Recog Channel");
 
-	/* Get WebSocket configuration from engine params */
-	ws_host = mrcp_engine_param_get(engine, "ws-host");
-	ws_port_str = mrcp_engine_param_get(engine, "ws-port");
-	ws_path = mrcp_engine_param_get(engine, "ws-path");
+    recog_channel = apr_palloc(pool, sizeof(websocket_recog_channel_t));
+    if (!recog_channel) {
+        return NULL;
+    }
+    
+    recog_channel->recog_engine = engine->obj;
+    recog_channel->recog_request = NULL;
+    recog_channel->stop_response = NULL;
+    recog_channel->timers_started = FALSE;
+    recog_channel->detector = mpf_activity_detector_create(pool);
+    recog_channel->ws_client = NULL;
+    recog_channel->speech_started = FALSE;
+    recog_channel->waiting_result = FALSE;
+    recog_channel->stream_pos = 0;
+    recog_channel->recognize_start_time = 0;
 
-	if(!ws_host) {
-		ws_host = "localhost";
-	}
-	if(!ws_port_str) {
-		ws_port = 8080;
-	} else {
-		ws_port = atoi(ws_port_str);
-	}
-	if(!ws_path) {
-		ws_path = "/";
-	}
+    /* Initialize audio buffer */
+    recog_channel->audio_buffer_size = AUDIO_BUFFER_SIZE;
+    recog_channel->audio_buffer = apr_palloc(pool, recog_channel->audio_buffer_size);
+    if (!recog_channel->audio_buffer) {
+        return NULL;
+    }
+    recog_channel->audio_buffer_pos = 0;
 
-	/* Create WebSocket client */
-	recog_channel->ws_client = apr_palloc(pool, sizeof(websocket_client_t));
-	recog_channel->ws_client->pool = pool;
-	recog_channel->ws_client->host = apr_pstrdup(pool, ws_host);
-	recog_channel->ws_client->port = ws_port;
-	recog_channel->ws_client->path = apr_pstrdup(pool, ws_path);
-	recog_channel->ws_client->socket = NULL;
-	recog_channel->ws_client->sa = NULL;
-	recog_channel->ws_client->connected = FALSE;
+    /* Create mutex */
+    if (apr_thread_mutex_create(&recog_channel->mutex, APR_THREAD_MUTEX_DEFAULT, pool) != APR_SUCCESS) {
+        return NULL;
+    }
 
-	capabilities = mpf_sink_stream_capabilities_create(pool);
-	mpf_codec_capabilities_add(
-			&capabilities->codecs,
-			MPF_SAMPLE_RATE_8000 | MPF_SAMPLE_RATE_16000,
-			"LPCM");
+    /* Get WebSocket configuration */
+    ws_client_config_init(&ws_config);
+    
+    ws_host = mrcp_engine_param_get(engine, "ws-host");
+    ws_port_str = mrcp_engine_param_get(engine, "ws-port");
+    ws_path = mrcp_engine_param_get(engine, "ws-path");
+    streaming_str = mrcp_engine_param_get(engine, "streaming");
 
-	/* create media termination */
-	termination = mrcp_engine_audio_termination_create(
-			recog_channel,        /* object to associate */
-			&audio_stream_vtable, /* virtual methods table of audio stream */
-			capabilities,         /* stream capabilities */
-			pool);                /* pool to allocate memory from */
+    ws_config.host = ws_host ? ws_host : "localhost";
+    ws_config.port = ws_port_str ? atoi(ws_port_str) : 8080;
+    ws_config.path = ws_path ? ws_path : "/asr";
+    ws_config.recv_timeout = RECV_POLL_INTERVAL;
+    
+    /* Enable streaming mode if configured */
+    recog_channel->streaming_enabled = (streaming_str && strcasecmp(streaming_str, "true") == 0);
 
-	/* create engine channel base */
-	recog_channel->channel = mrcp_engine_channel_create(
-			engine,               /* engine */
-			&channel_vtable,      /* virtual methods table of engine channel */
-			recog_channel,        /* object to associate */
-			termination,          /* associated media termination */
-			pool);                /* pool to allocate memory from */
+    apt_log(RECOG_LOG_MARK, APT_PRIO_INFO, 
+        "WebSocket Config: host=%s port=%d path=%s streaming=%s",
+        ws_config.host, ws_config.port, ws_config.path,
+        recog_channel->streaming_enabled ? "enabled" : "disabled");
 
-	return recog_channel->channel;
+    /* Create WebSocket client */
+    recog_channel->ws_client = ws_client_create(pool, &ws_config);
+    if (!recog_channel->ws_client) {
+        return NULL;
+    }
+
+    /* Create sink stream capabilities (ASR receives audio) */
+    capabilities = mpf_sink_stream_capabilities_create(pool);
+    mpf_codec_capabilities_add(
+        &capabilities->codecs,
+        MPF_SAMPLE_RATE_8000 | MPF_SAMPLE_RATE_16000,
+        "LPCM");
+
+    termination = mrcp_engine_audio_termination_create(
+        recog_channel,
+        &audio_stream_vtable,
+        capabilities,
+        pool);
+
+    recog_channel->channel = mrcp_engine_channel_create(
+        engine,
+        &channel_vtable,
+        recog_channel,
+        termination,
+        pool);
+
+    return recog_channel->channel;
 }
 
-/** Destroy engine channel */
 static apt_bool_t websocket_recog_channel_destroy(mrcp_engine_channel_t *channel)
 {
-	websocket_recog_channel_t *recog_channel = channel->method_obj;
-	if(recog_channel->ws_client) {
-		websocket_client_destroy(recog_channel->ws_client);
-	}
-	/* audio_buffer is allocated from pool, will be freed automatically */
-	return TRUE;
+    websocket_recog_channel_t *recog_channel = channel->method_obj;
+    apt_log(RECOG_LOG_MARK, APT_PRIO_INFO, "Destroy WebSocket Recog Channel");
+    
+    if (recog_channel->ws_client) {
+        ws_client_destroy(recog_channel->ws_client);
+        recog_channel->ws_client = NULL;
+    }
+    if (recog_channel->mutex) {
+        apr_thread_mutex_destroy(recog_channel->mutex);
+        recog_channel->mutex = NULL;
+    }
+    return TRUE;
 }
 
-/** Open engine channel (asynchronous response MUST be sent)*/
 static apt_bool_t websocket_recog_channel_open(mrcp_engine_channel_t *channel)
 {
-	if(channel->attribs) {
-		/* process attributes */
-		const apr_array_header_t *header = apr_table_elts(channel->attribs);
-		apr_table_entry_t *entry = (apr_table_entry_t *)header->elts;
-		int i;
-		for(i=0; i<header->nelts; i++) {
-			apt_log(WEBSOCKET_RECOG_LOG_MARK,APT_PRIO_INFO,"Attrib name [%s] value [%s]",entry[i].key,entry[i].val);
-		}
-	}
+    apt_log(RECOG_LOG_MARK, APT_PRIO_INFO, "Open WebSocket Recog Channel");
+    
+    if (channel->attribs) {
+        const apr_array_header_t *header = apr_table_elts(channel->attribs);
+        apr_table_entry_t *entry = (apr_table_entry_t*)header->elts;
+        int i;
+        for (i = 0; i < header->nelts; i++) {
+            apt_log(RECOG_LOG_MARK, APT_PRIO_DEBUG, 
+                "Attrib: %s=%s", entry[i].key, entry[i].val);
+        }
+    }
 
-	return websocket_recog_msg_signal(WEBSOCKET_RECOG_MSG_OPEN_CHANNEL,channel,NULL);
+    return websocket_recog_msg_signal(WEBSOCKET_RECOG_MSG_OPEN_CHANNEL, channel, NULL);
 }
 
-/** Close engine channel (asynchronous response MUST be sent)*/
 static apt_bool_t websocket_recog_channel_close(mrcp_engine_channel_t *channel)
 {
-	return websocket_recog_msg_signal(WEBSOCKET_RECOG_MSG_CLOSE_CHANNEL,channel,NULL);
+    apt_log(RECOG_LOG_MARK, APT_PRIO_INFO, "Close WebSocket Recog Channel");
+    return websocket_recog_msg_signal(WEBSOCKET_RECOG_MSG_CLOSE_CHANNEL, channel, NULL);
 }
 
-/** Process MRCP channel request (asynchronous response MUST be sent)*/
 static apt_bool_t websocket_recog_channel_request_process(mrcp_engine_channel_t *channel, mrcp_message_t *request)
 {
-	return websocket_recog_msg_signal(WEBSOCKET_RECOG_MSG_REQUEST_PROCESS,channel,request);
+    return websocket_recog_msg_signal(WEBSOCKET_RECOG_MSG_REQUEST_PROCESS, channel, request);
 }
 
-/** Process RECOGNIZE request */
-static apt_bool_t websocket_recog_channel_recognize(mrcp_engine_channel_t *channel, mrcp_message_t *request, mrcp_message_t *response)
-{
-	/* process RECOGNIZE request */
-	mrcp_recog_header_t *recog_header;
-	websocket_recog_channel_t *recog_channel = channel->method_obj;
-	const mpf_codec_descriptor_t *descriptor = mrcp_engine_sink_stream_codec_get(channel);
+/*******************************************************************************
+ * Audio Stream Implementation
+ ******************************************************************************/
 
-	if(!descriptor) {
-		apt_log(WEBSOCKET_RECOG_LOG_MARK,APT_PRIO_WARNING,"Failed to Get Codec Descriptor " APT_SIDRES_FMT, MRCP_MESSAGE_SIDRES(request));
-		response->start_line.status_code = MRCP_STATUS_CODE_METHOD_FAILED;
-		return FALSE;
-	}
-
-	recog_channel->timers_started = TRUE;
-
-	/* get recognizer header */
-	recog_header = mrcp_resource_header_get(request);
-	if(recog_header) {
-		if(mrcp_resource_header_property_check(request,RECOGNIZER_HEADER_START_INPUT_TIMERS) == TRUE) {
-			recog_channel->timers_started = recog_header->start_input_timers;
-		}
-		if(mrcp_resource_header_property_check(request,RECOGNIZER_HEADER_NO_INPUT_TIMEOUT) == TRUE) {
-			mpf_activity_detector_noinput_timeout_set(recog_channel->detector,recog_header->no_input_timeout);
-		}
-		if(mrcp_resource_header_property_check(request,RECOGNIZER_HEADER_SPEECH_COMPLETE_TIMEOUT) == TRUE) {
-			mpf_activity_detector_silence_timeout_set(recog_channel->detector,recog_header->speech_complete_timeout);
-		}
-	}
-
-	/* Connect to WebSocket server if not connected */
-	if(!recog_channel->ws_client->connected) {
-		if(websocket_client_connect(recog_channel->ws_client) != TRUE) {
-			apt_log(WEBSOCKET_RECOG_LOG_MARK,APT_PRIO_ERROR,"Failed to Connect to WebSocket Server");
-			response->start_line.status_code = MRCP_STATUS_CODE_METHOD_FAILED;
-			return FALSE;
-		}
-	}
-
-	/* Initialize audio buffer */
-	if(!recog_channel->audio_buffer) {
-		recog_channel->audio_buffer_size = descriptor->sampling_rate * 2; /* 1 second buffer */
-		recog_channel->audio_buffer = apr_palloc(channel->pool, recog_channel->audio_buffer_size);
-		recog_channel->audio_buffer_pos = 0;
-	}
-
-	response->start_line.request_state = MRCP_REQUEST_STATE_INPROGRESS;
-	/* send asynchronous response */
-	mrcp_engine_channel_message_send(channel,response);
-	recog_channel->recog_request = request;
-	return TRUE;
-}
-
-/** Process STOP request */
-static apt_bool_t websocket_recog_channel_stop(mrcp_engine_channel_t *channel, mrcp_message_t *request, mrcp_message_t *response)
-{
-	/* process STOP request */
-	websocket_recog_channel_t *recog_channel = channel->method_obj;
-	/* store STOP request, make sure there is no more activity and only then send the response */
-	recog_channel->stop_response = response;
-	return TRUE;
-}
-
-/** Process START-INPUT-TIMERS request */
-static apt_bool_t websocket_recog_channel_timers_start(mrcp_engine_channel_t *channel, mrcp_message_t *request, mrcp_message_t *response)
-{
-	websocket_recog_channel_t *recog_channel = channel->method_obj;
-	recog_channel->timers_started = TRUE;
-	return mrcp_engine_channel_message_send(channel,response);
-}
-
-/** Dispatch MRCP request */
-static apt_bool_t websocket_recog_channel_request_dispatch(mrcp_engine_channel_t *channel, mrcp_message_t *request)
-{
-	apt_bool_t processed = FALSE;
-	mrcp_message_t *response = mrcp_response_create(request,request->pool);
-	switch(request->start_line.method_id) {
-		case RECOGNIZER_SET_PARAMS:
-			break;
-		case RECOGNIZER_GET_PARAMS:
-			break;
-		case RECOGNIZER_DEFINE_GRAMMAR:
-			break;
-		case RECOGNIZER_RECOGNIZE:
-			processed = websocket_recog_channel_recognize(channel,request,response);
-			break;
-		case RECOGNIZER_GET_RESULT:
-			break;
-		case RECOGNIZER_START_INPUT_TIMERS:
-			processed = websocket_recog_channel_timers_start(channel,request,response);
-			break;
-		case RECOGNIZER_STOP:
-			processed = websocket_recog_channel_stop(channel,request,response);
-			break;
-		default:
-			break;
-	}
-	if(processed == FALSE) {
-		/* send asynchronous response for not handled request */
-		mrcp_engine_channel_message_send(channel,response);
-	}
-	return TRUE;
-}
-
-/** Callback is called from MPF engine context to destroy any additional data associated with audio stream */
 static apt_bool_t websocket_recog_stream_destroy(mpf_audio_stream_t *stream)
 {
-	return TRUE;
+    return TRUE;
 }
 
-/** Callback is called from MPF engine context to perform any action before open */
 static apt_bool_t websocket_recog_stream_open(mpf_audio_stream_t *stream, mpf_codec_t *codec)
 {
-	return TRUE;
+    return TRUE;
 }
 
-/** Callback is called from MPF engine context to perform any action after close */
 static apt_bool_t websocket_recog_stream_close(mpf_audio_stream_t *stream)
 {
-	return TRUE;
+    return TRUE;
 }
 
-/* Raise websocket START-OF-INPUT event */
+/** START-OF-INPUT event */
 static apt_bool_t websocket_recog_start_of_input(websocket_recog_channel_t *recog_channel)
 {
-	/* create START-OF-INPUT event */
-	mrcp_message_t *message = mrcp_event_create(
-						recog_channel->recog_request,
-						RECOGNIZER_START_OF_INPUT,
-						recog_channel->recog_request->pool);
-	if(!message) {
-		return FALSE;
-	}
+    mrcp_message_t *message;
+    
+    if (!recog_channel->recog_request) {
+        return FALSE;
+    }
+    
+    message = mrcp_event_create(
+        recog_channel->recog_request,
+        RECOGNIZER_START_OF_INPUT,
+        recog_channel->recog_request->pool);
+    if (!message) {
+        return FALSE;
+    }
 
-	/* set request state */
-	message->start_line.request_state = MRCP_REQUEST_STATE_INPROGRESS;
-	/* send asynch event */
-	return mrcp_engine_channel_message_send(recog_channel->channel,message);
+    message->start_line.request_state = MRCP_REQUEST_STATE_INPROGRESS;
+    return mrcp_engine_channel_message_send(recog_channel->channel, message);
 }
 
-/* Process WebSocket recognition result */
-static apt_bool_t websocket_recog_result_process(websocket_recog_channel_t *recog_channel, const char *result_text)
+/** RECOGNITION-COMPLETE event */
+static apt_bool_t websocket_recog_recognition_complete(
+    websocket_recog_channel_t *recog_channel,
+    mrcp_recog_completion_cause_e cause,
+    const char *result_text)
 {
-	mrcp_recog_header_t *recog_header;
-	/* create RECOGNITION-COMPLETE event */
-	mrcp_message_t *message = mrcp_event_create(
-						recog_channel->recog_request,
-						RECOGNIZER_RECOGNITION_COMPLETE,
-						recog_channel->recog_request->pool);
-	if(!message) {
-		return FALSE;
-	}
+    mrcp_message_t *message;
+    mrcp_recog_header_t *recog_header;
+    
+    if (!recog_channel->recog_request) {
+        return FALSE;
+    }
 
-	/* get/allocate recognizer header */
-	recog_header = mrcp_resource_header_prepare(message);
-	if(recog_header) {
-		/* set completion cause */
-		recog_header->completion_cause = RECOGNIZER_COMPLETION_CAUSE_SUCCESS;
-		mrcp_resource_header_property_add(message,RECOGNIZER_HEADER_COMPLETION_CAUSE);
-	}
-	/* set request state */
-	message->start_line.request_state = MRCP_REQUEST_STATE_COMPLETE;
+    message = mrcp_event_create(
+        recog_channel->recog_request,
+        RECOGNIZER_RECOGNITION_COMPLETE,
+        recog_channel->recog_request->pool);
+    if (!message) {
+        return FALSE;
+    }
 
-	/* Set result body if available */
-	if(result_text && strlen(result_text) > 0) {
-		mrcp_generic_header_t *generic_header = mrcp_generic_header_prepare(message);
-		if(generic_header) {
-			apt_string_assign(&message->body, result_text, message->pool);
-			apt_string_assign(&generic_header->content_type, "application/x-nlsml", message->pool);
-			mrcp_generic_header_property_add(message, GENERIC_HEADER_CONTENT_TYPE);
-		}
-	}
+    recog_header = mrcp_resource_header_prepare(message);
+    if (recog_header) {
+        recog_header->completion_cause = cause;
+        mrcp_resource_header_property_add(message, RECOGNIZER_HEADER_COMPLETION_CAUSE);
+    }
 
-	recog_channel->recog_request = NULL;
-	/* send asynch event */
-	return mrcp_engine_channel_message_send(recog_channel->channel,message);
+    message->start_line.request_state = MRCP_REQUEST_STATE_COMPLETE;
+
+    /* Set result body */
+    if (result_text && strlen(result_text) > 0) {
+        mrcp_generic_header_t *generic_header = mrcp_generic_header_prepare(message);
+        if (generic_header) {
+            apt_string_assign(&message->body, result_text, message->pool);
+            apt_string_assign(&generic_header->content_type, "application/x-nlsml", message->pool);
+            mrcp_generic_header_property_add(message, GENERIC_HEADER_CONTENT_TYPE);
+        }
+    }
+
+    recog_channel->recog_request = NULL;
+    recog_channel->waiting_result = FALSE;
+
+    apt_log(RECOG_LOG_MARK, APT_PRIO_INFO, "RECOGNITION-COMPLETE: cause=%d", cause);
+
+    return mrcp_engine_channel_message_send(recog_channel->channel, message);
 }
 
-/* Raise websocket RECOGNITION-COMPLETE event */
-static apt_bool_t websocket_recog_recognition_complete(websocket_recog_channel_t *recog_channel, mrcp_recog_completion_cause_e cause)
-{
-	mrcp_recog_header_t *recog_header;
-	/* create RECOGNITION-COMPLETE event */
-	mrcp_message_t *message = mrcp_event_create(
-						recog_channel->recog_request,
-						RECOGNIZER_RECOGNITION_COMPLETE,
-						recog_channel->recog_request->pool);
-	if(!message) {
-		return FALSE;
-	}
-
-	/* get/allocate recognizer header */
-	recog_header = mrcp_resource_header_prepare(message);
-	if(recog_header) {
-		/* set completion cause */
-		recog_header->completion_cause = cause;
-		mrcp_resource_header_property_add(message,RECOGNIZER_HEADER_COMPLETION_CAUSE);
-	}
-	/* set request state */
-	message->start_line.request_state = MRCP_REQUEST_STATE_COMPLETE;
-
-	recog_channel->recog_request = NULL;
-	/* send asynch event */
-	return mrcp_engine_channel_message_send(recog_channel->channel,message);
-}
-
-/** Callback is called from MPF engine context to write/send new frame */
+/** Write audio frame (called from MPF context) */
 static apt_bool_t websocket_recog_stream_write(mpf_audio_stream_t *stream, const mpf_frame_t *frame)
 {
-	websocket_recog_channel_t *recog_channel = stream->obj;
-	if(recog_channel->stop_response) {
-		/* send asynchronous response to STOP request */
-		mrcp_engine_channel_message_send(recog_channel->channel,recog_channel->stop_response);
-		recog_channel->stop_response = NULL;
-		recog_channel->recog_request = NULL;
-		return TRUE;
-	}
+    websocket_recog_channel_t *recog_channel = stream->obj;
+    
+    /* Handle STOP request */
+    if (recog_channel->stop_response) {
+        mrcp_engine_channel_message_send(recog_channel->channel, recog_channel->stop_response);
+        recog_channel->stop_response = NULL;
+        recog_channel->recog_request = NULL;
+        return TRUE;
+    }
 
-	if(recog_channel->recog_request && recog_channel->ws_client && recog_channel->ws_client->connected) {
-		mpf_detector_event_e det_event = mpf_activity_detector_process(recog_channel->detector,frame);
-		switch(det_event) {
-			case MPF_DETECTOR_EVENT_ACTIVITY:
-				apt_log(WEBSOCKET_RECOG_LOG_MARK,APT_PRIO_INFO,"Detected Voice Activity " APT_SIDRES_FMT,
-					MRCP_MESSAGE_SIDRES(recog_channel->recog_request));
-				websocket_recog_start_of_input(recog_channel);
-				break;
-			case MPF_DETECTOR_EVENT_INACTIVITY:
-				apt_log(WEBSOCKET_RECOG_LOG_MARK,APT_PRIO_INFO,"Detected Voice Inactivity " APT_SIDRES_FMT,
-					MRCP_MESSAGE_SIDRES(recog_channel->recog_request));
-				/* P1: Send audio buffer via background task instead of directly */
-				if(recog_channel->audio_buffer_pos > 0) {
-					/* Signal background task to send audio data (non-blocking) */
-					websocket_recog_msg_signal(WEBSOCKET_RECOG_MSG_SEND_AUDIO, recog_channel->channel, NULL);
-					/* Don't clear buffer or complete here - background task will handle it */
-				} else {
-					websocket_recog_recognition_complete(recog_channel,RECOGNIZER_COMPLETION_CAUSE_SUCCESS);
-				}
-				break;
-			case MPF_DETECTOR_EVENT_NOINPUT:
-				apt_log(WEBSOCKET_RECOG_LOG_MARK,APT_PRIO_INFO,"Detected Noinput " APT_SIDRES_FMT,
-					MRCP_MESSAGE_SIDRES(recog_channel->recog_request));
-				if(recog_channel->timers_started == TRUE) {
-					websocket_recog_recognition_complete(recog_channel,RECOGNIZER_COMPLETION_CAUSE_NO_INPUT_TIMEOUT);
-				}
-				break;
-			default:
-				break;
-		}
+    if (!recog_channel->recog_request || !recog_channel->ws_client) {
+        return TRUE;
+    }
 
-		/* Buffer audio data for WebSocket transmission */
-		if((frame->type & MEDIA_FRAME_TYPE_AUDIO) == MEDIA_FRAME_TYPE_AUDIO) {
-			apr_size_t remaining = recog_channel->audio_buffer_size - recog_channel->audio_buffer_pos;
-			apr_size_t to_copy = frame->codec_frame.size;
-			if(to_copy > remaining) {
-				to_copy = remaining;
-			}
-			if(to_copy > 0) {
-				memcpy(recog_channel->audio_buffer + recog_channel->audio_buffer_pos, 
-				       frame->codec_frame.buffer, to_copy);
-				recog_channel->audio_buffer_pos += to_copy;
-			}
-		}
-	}
-	return TRUE;
+    /* Process audio through VAD */
+    if (ws_client_is_connected(recog_channel->ws_client)) {
+        mpf_detector_event_e det_event = mpf_activity_detector_process(recog_channel->detector, frame);
+        
+        switch (det_event) {
+            case MPF_DETECTOR_EVENT_ACTIVITY:
+                apt_log(RECOG_LOG_MARK, APT_PRIO_INFO, "Voice Activity Detected");
+                recog_channel->speech_started = TRUE;
+                websocket_recog_start_of_input(recog_channel);
+                break;
+                
+            case MPF_DETECTOR_EVENT_INACTIVITY:
+                apt_log(RECOG_LOG_MARK, APT_PRIO_INFO, "Voice Inactivity Detected");
+                if (recog_channel->audio_buffer_pos > 0) {
+                    /* Send buffered audio and wait for result */
+                    websocket_recog_msg_signal(WEBSOCKET_RECOG_MSG_SEND_AUDIO, 
+                        recog_channel->channel, NULL);
+                } else {
+                    websocket_recog_recognition_complete(recog_channel, 
+                        RECOGNIZER_COMPLETION_CAUSE_SUCCESS, NULL);
+                }
+                break;
+                
+            case MPF_DETECTOR_EVENT_NOINPUT:
+                apt_log(RECOG_LOG_MARK, APT_PRIO_INFO, "No Input Detected");
+                if (recog_channel->timers_started) {
+                    websocket_recog_recognition_complete(recog_channel, 
+                        RECOGNIZER_COMPLETION_CAUSE_NO_INPUT_TIMEOUT, NULL);
+                }
+                break;
+                
+            default:
+                break;
+        }
+
+        /* Buffer audio data */
+        if ((frame->type & MEDIA_FRAME_TYPE_AUDIO) == MEDIA_FRAME_TYPE_AUDIO) {
+            apr_thread_mutex_lock(recog_channel->mutex);
+            
+            apr_size_t remaining = recog_channel->audio_buffer_size - recog_channel->audio_buffer_pos;
+            apr_size_t to_copy = frame->codec_frame.size;
+            
+            if (to_copy > remaining) {
+                to_copy = remaining;
+                apt_log(RECOG_LOG_MARK, APT_PRIO_WARNING, "Audio buffer full");
+            }
+            
+            if (to_copy > 0) {
+                memcpy(recog_channel->audio_buffer + recog_channel->audio_buffer_pos,
+                       frame->codec_frame.buffer, to_copy);
+                recog_channel->audio_buffer_pos += to_copy;
+            }
+            
+            apr_thread_mutex_unlock(recog_channel->mutex);
+            
+            /* Stream audio in real-time if enabled */
+            if (recog_channel->streaming_enabled && recog_channel->speech_started) {
+                apr_size_t unsent = recog_channel->audio_buffer_pos - recog_channel->stream_pos;
+                if (unsent >= STREAM_CHUNK_SIZE) {
+                    websocket_recog_msg_signal_audio(recog_channel->channel,
+                        recog_channel->audio_buffer + recog_channel->stream_pos,
+                        STREAM_CHUNK_SIZE);
+                    recog_channel->stream_pos += STREAM_CHUNK_SIZE;
+                }
+            }
+        }
+    }
+
+    return TRUE;
 }
 
-/** WebSocket client implementation */
-static apt_bool_t websocket_client_connect(websocket_client_t *ws_client)
+/*******************************************************************************
+ * MRCP Request Handling
+ ******************************************************************************/
+
+static apt_bool_t websocket_recog_channel_recognize(
+    mrcp_engine_channel_t *channel,
+    mrcp_message_t *request,
+    mrcp_message_t *response)
 {
-	apr_status_t rv;
-	char *key;
-	char *accept_key;
-	char request[2048];
-	char response[4096];
-	apr_size_t response_len;
-	const char *host_header;
-	char *path_header;
+    websocket_recog_channel_t *recog_channel = channel->method_obj;
+    mrcp_recog_header_t *recog_header;
+    const mpf_codec_descriptor_t *descriptor = mrcp_engine_sink_stream_codec_get(channel);
 
-	if(ws_client->connected) {
-		return TRUE;
-	}
+    if (!descriptor) {
+        apt_log(RECOG_LOG_MARK, APT_PRIO_WARNING, 
+            "Failed to get codec descriptor " APT_SIDRES_FMT, MRCP_MESSAGE_SIDRES(request));
+        response->start_line.status_code = MRCP_STATUS_CODE_METHOD_FAILED;
+        return FALSE;
+    }
 
-	/* Create socket */
-	rv = apr_socket_create(&ws_client->socket, APR_INET, SOCK_STREAM, APR_PROTO_TCP, ws_client->pool);
-	if(rv != APR_SUCCESS) {
-		apt_log(WEBSOCKET_RECOG_LOG_MARK,APT_PRIO_ERROR,"Failed to Create Socket");
-		return FALSE;
-	}
+    recog_channel->timers_started = TRUE;
 
-	/* Set socket to non-blocking mode (P1 improvement) */
-	apr_socket_opt_set(ws_client->socket, APR_SO_NONBLOCK, 1);
+    /* Get recognizer header */
+    recog_header = mrcp_resource_header_get(request);
+    if (recog_header) {
+        if (mrcp_resource_header_property_check(request, RECOGNIZER_HEADER_START_INPUT_TIMERS) == TRUE) {
+            recog_channel->timers_started = recog_header->start_input_timers;
+        }
+        if (mrcp_resource_header_property_check(request, RECOGNIZER_HEADER_NO_INPUT_TIMEOUT) == TRUE) {
+            mpf_activity_detector_noinput_timeout_set(recog_channel->detector, recog_header->no_input_timeout);
+        }
+        if (mrcp_resource_header_property_check(request, RECOGNIZER_HEADER_SPEECH_COMPLETE_TIMEOUT) == TRUE) {
+            mpf_activity_detector_silence_timeout_set(recog_channel->detector, recog_header->speech_complete_timeout);
+        }
+    }
 
-	/* Resolve hostname */
-	rv = apr_sockaddr_info_get(&ws_client->sa, ws_client->host, APR_INET, ws_client->port, 0, ws_client->pool);
-	if(rv != APR_SUCCESS) {
-		apt_log(WEBSOCKET_RECOG_LOG_MARK,APT_PRIO_ERROR,"Failed to Resolve Hostname [%s]", ws_client->host);
-		return FALSE;
-	}
+    /* Connect to WebSocket server */
+    if (!ws_client_ensure_connected(recog_channel->ws_client)) {
+        apt_log(RECOG_LOG_MARK, APT_PRIO_ERROR, "Failed to connect to ASR server");
+        response->start_line.status_code = MRCP_STATUS_CODE_METHOD_FAILED;
+        return FALSE;
+    }
 
-	/* Connect */
-	rv = apr_socket_connect(ws_client->socket, ws_client->sa);
-	if(rv != APR_SUCCESS) {
-		apt_log(WEBSOCKET_RECOG_LOG_MARK,APT_PRIO_ERROR,"Failed to Connect to [%s:%d]", ws_client->host, ws_client->port);
-		return FALSE;
-	}
+    /* Reset state */
+    apr_thread_mutex_lock(recog_channel->mutex);
+    recog_channel->audio_buffer_pos = 0;
+    recog_channel->stream_pos = 0;
+    recog_channel->speech_started = FALSE;
+    recog_channel->waiting_result = FALSE;
+    recog_channel->recognize_start_time = apr_time_now();
+    apr_thread_mutex_unlock(recog_channel->mutex);
 
-	/* P2: Generate random WebSocket key (16 bytes, Base64 encoded) */
-	{
-		unsigned char random_key[16];
-		apr_uuid_t uuid;
-		char *key_buf;
-		apr_uuid_get(&uuid);
-		/* Use UUID as random source (16 bytes) */
-		memcpy(random_key, uuid.data, 16);
-		
-		/* Base64 encode */
-		key_buf = apr_palloc(ws_client->pool, apr_base64_encode_len(16) + 1);
-		apr_base64_encode(key_buf, (char*)random_key, 16);
-		key = key_buf;
-	}
+    /* Send response */
+    response->start_line.request_state = MRCP_REQUEST_STATE_INPROGRESS;
+    mrcp_engine_channel_message_send(channel, response);
+    recog_channel->recog_request = request;
 
-	/* Send WebSocket handshake */
-	host_header = apr_psprintf(ws_client->pool, "%s:%d", ws_client->host, ws_client->port);
-	path_header = ws_client->path ? ws_client->path : "/";
-	
-	apr_snprintf(request, sizeof(request),
-		"GET %s HTTP/1.1\r\n"
-		"Host: %s\r\n"
-		"Upgrade: websocket\r\n"
-		"Connection: Upgrade\r\n"
-		"Sec-WebSocket-Key: %s\r\n"
-		"Sec-WebSocket-Version: 13\r\n"
-		"\r\n",
-		path_header, host_header, key);
+    apt_log(RECOG_LOG_MARK, APT_PRIO_INFO, 
+        "RECOGNIZE: sample_rate=%d " APT_SIDRES_FMT,
+        descriptor->sampling_rate, MRCP_MESSAGE_SIDRES(request));
 
-	rv = apr_socket_send(ws_client->socket, request, &response_len);
-	if(rv != APR_SUCCESS) {
-		apt_log(WEBSOCKET_RECOG_LOG_MARK,APT_PRIO_ERROR,"Failed to Send WebSocket Handshake");
-		return FALSE;
-	}
-
-	/* Read response */
-	response_len = sizeof(response) - 1;
-	rv = apr_socket_recv(ws_client->socket, response, &response_len);
-	if(rv != APR_SUCCESS) {
-		apt_log(WEBSOCKET_RECOG_LOG_MARK,APT_PRIO_ERROR,"Failed to Receive WebSocket Handshake Response");
-		return FALSE;
-	}
-	response[response_len] = '\0';
-
-	/* Check for "101 Switching Protocols" */
-	if(strstr(response, "101") == NULL && strstr(response, "Switching Protocols") == NULL) {
-		apt_log(WEBSOCKET_RECOG_LOG_MARK,APT_PRIO_ERROR,"WebSocket Handshake Failed: %s", response);
-		return FALSE;
-	}
-
-	ws_client->connected = TRUE;
-	apt_log(WEBSOCKET_RECOG_LOG_MARK,APT_PRIO_INFO,"WebSocket Connected to [%s:%d%s]", 
-		ws_client->host, ws_client->port, path_header);
-	return TRUE;
+    return TRUE;
 }
 
-static apt_bool_t websocket_client_send(websocket_client_t *ws_client, const char *data, apr_size_t len)
+static apt_bool_t websocket_recog_channel_stop(
+    mrcp_engine_channel_t *channel,
+    mrcp_message_t *request,
+    mrcp_message_t *response)
 {
-	apr_status_t rv;
-	apr_size_t sent;
-	unsigned char frame[14];
-	apr_size_t frame_len = 0;
-	apr_size_t payload_len;
-	unsigned char mask[4];
-	apr_size_t i;
-
-	if(!ws_client->connected || !ws_client->socket) {
-		return FALSE;
-	}
-
-	/* Generate masking key (simplified - use pseudo-random from current time) */
-	apr_time_t now = apr_time_now();
-	apr_int64_t time_usec = now;
-	mask[0] = (unsigned char)(time_usec & 0xFF);
-	mask[1] = (unsigned char)((time_usec >> 8) & 0xFF);
-	mask[2] = (unsigned char)((time_usec >> 16) & 0xFF);
-	mask[3] = (unsigned char)((time_usec >> 24) & 0xFF);
-
-	/* WebSocket frame format: FIN=1, opcode=2 (binary frame), MASK=1 */
-	frame[0] = 0x82; /* FIN=1, opcode=2 (binary frame) */
-	
-	if(len < 126) {
-		frame[1] = 0x80 | len; /* MASK=1, payload len */
-		frame[2] = mask[0];
-		frame[3] = mask[1];
-		frame[4] = mask[2];
-		frame[5] = mask[3];
-		frame_len = 6;
-	} else if(len < 65536) {
-		frame[1] = 0xFE; /* MASK=1, extended payload length (16-bit) */
-		frame[2] = (len >> 8) & 0xFF;
-		frame[3] = len & 0xFF;
-		frame[4] = mask[0];
-		frame[5] = mask[1];
-		frame[6] = mask[2];
-		frame[7] = mask[3];
-		frame_len = 8;
-	} else {
-		frame[1] = 0xFF; /* MASK=1, extended payload length (64-bit) */
-		/* For simplicity, assume len < 2^32 */
-		frame[2] = 0;
-		frame[3] = 0;
-		frame[4] = 0;
-		frame[5] = 0;
-		frame[6] = (len >> 24) & 0xFF;
-		frame[7] = (len >> 16) & 0xFF;
-		frame[8] = (len >> 8) & 0xFF;
-		frame[9] = len & 0xFF;
-		frame[10] = mask[0];
-		frame[11] = mask[1];
-		frame[12] = mask[2];
-		frame[13] = mask[3];
-		frame_len = 14;
-	}
-
-	/* Send frame header */
-	sent = frame_len;
-	rv = apr_socket_send(ws_client->socket, (char*)frame, &sent);
-	if(rv != APR_SUCCESS || sent != frame_len) {
-		apt_log(WEBSOCKET_RECOG_LOG_MARK,APT_PRIO_ERROR,"Failed to Send WebSocket Frame Header");
-		return FALSE;
-	}
-
-	/* Apply mask to payload and send */
-	/* Note: In production, should allocate temporary buffer for masked data */
-	/* For simplicity, we send masked data directly (modifies original data) */
-	if(len > 0) {
-		char *masked_data = (char*)apr_palloc(ws_client->pool, len);
-		if(!masked_data) {
-			return FALSE;
-		}
-		for(i = 0; i < len; i++) {
-			masked_data[i] = data[i] ^ mask[i % 4];
-		}
-		
-		payload_len = len;
-		rv = apr_socket_send(ws_client->socket, masked_data, &payload_len);
-		if(rv != APR_SUCCESS || payload_len != len) {
-			apt_log(WEBSOCKET_RECOG_LOG_MARK,APT_PRIO_ERROR,"Failed to Send WebSocket Payload");
-			return FALSE;
-		}
-	}
-
-	return TRUE;
+    websocket_recog_channel_t *recog_channel = channel->method_obj;
+    apt_log(RECOG_LOG_MARK, APT_PRIO_INFO, "STOP Request");
+    
+    recog_channel->stop_response = response;
+    return TRUE;
 }
 
-static apt_bool_t websocket_client_receive(websocket_client_t *ws_client, char *buffer, apr_size_t *len)
+static apt_bool_t websocket_recog_channel_timers_start(
+    mrcp_engine_channel_t *channel,
+    mrcp_message_t *request,
+    mrcp_message_t *response)
 {
-	apr_status_t rv;
-	unsigned char header[14];
-	apr_size_t header_len;
-	apr_size_t payload_len;
-	unsigned char opcode;
-	apt_bool_t fin;
-	apr_size_t received;
-	apr_size_t remaining;
-	apr_size_t max_len;
-
-	if(!ws_client->connected || !ws_client->socket || !buffer || !len) {
-		return FALSE;
-	}
-
-	max_len = *len;
-	*len = 0;
-
-	/* Set socket timeout for receive */
-	apr_socket_timeout_set(ws_client->socket, 5 * 1000000); /* 5 seconds */
-
-	/* Read frame header (at least 2 bytes) */
-	header_len = 2;
-	rv = apr_socket_recv(ws_client->socket, (char*)header, &header_len);
-	if(rv != APR_SUCCESS || header_len < 2) {
-		apt_log(WEBSOCKET_RECOG_LOG_MARK,APT_PRIO_DEBUG,"WebSocket receive timeout or error");
-		return FALSE;
-	}
-
-	fin = (header[0] & 0x80) != 0;
-	opcode = header[0] & 0x0F;
-	payload_len = header[1] & 0x7F;
-
-	/* Extended payload length */
-	if(payload_len == 126) {
-		header_len = 2;
-		rv = apr_socket_recv(ws_client->socket, (char*)&header[2], &header_len);
-		if(rv != APR_SUCCESS || header_len < 2) {
-			return FALSE;
-		}
-		payload_len = ((apr_size_t)header[2] << 8) | header[3];
-	} else if(payload_len == 127) {
-		header_len = 8;
-		rv = apr_socket_recv(ws_client->socket, (char*)&header[2], &header_len);
-		if(rv != APR_SUCCESS || header_len < 8) {
-			return FALSE;
-		}
-		payload_len = ((apr_size_t)header[6] << 24) | ((apr_size_t)header[7] << 16) |
-		              ((apr_size_t)header[8] << 8) | header[9];
-	}
-
-	/* Handle close frame */
-	if(opcode == 0x08) {
-		apt_log(WEBSOCKET_RECOG_LOG_MARK,APT_PRIO_INFO,"WebSocket close frame received");
-		ws_client->connected = FALSE;
-		return FALSE;
-	}
-
-	/* Handle ping frame */
-	if(opcode == 0x09) {
-		/* Send pong response */
-		unsigned char pong[2] = {0x8A, 0x00};
-		apr_size_t pong_len = 2;
-		apr_socket_send(ws_client->socket, (char*)pong, &pong_len);
-		*len = 0;
-		return TRUE;
-	}
-
-	/* Read payload (text or binary frame) */
-	if(payload_len > 0 && (opcode == 0x01 || opcode == 0x02)) {
-		apr_size_t to_read = (payload_len < max_len) ? payload_len : max_len;
-		received = 0;
-		while(received < to_read) {
-			remaining = to_read - received;
-			rv = apr_socket_recv(ws_client->socket, buffer + received, &remaining);
-			if(rv != APR_SUCCESS) {
-				return FALSE;
-			}
-			received += remaining;
-		}
-		*len = received;
-		
-		/* If we couldn't read the full payload, discard the rest */
-		if(payload_len > max_len) {
-			char discard[1024];
-			apr_size_t discard_remaining = payload_len - max_len;
-			while(discard_remaining > 0) {
-				apr_size_t chunk = (discard_remaining < sizeof(discard)) ? discard_remaining : sizeof(discard);
-				rv = apr_socket_recv(ws_client->socket, discard, &chunk);
-				if(rv != APR_SUCCESS) break;
-				discard_remaining -= chunk;
-			}
-		}
-		
-		return TRUE;
-	}
-
-	return TRUE;
+    websocket_recog_channel_t *recog_channel = channel->method_obj;
+    recog_channel->timers_started = TRUE;
+    return mrcp_engine_channel_message_send(channel, response);
 }
 
-static void websocket_client_destroy(websocket_client_t *ws_client)
+static apt_bool_t websocket_recog_channel_set_params(
+    mrcp_engine_channel_t *channel,
+    mrcp_message_t *request,
+    mrcp_message_t *response)
 {
-	if(ws_client->socket) {
-		apr_socket_close(ws_client->socket);
-		ws_client->socket = NULL;
-	}
-	ws_client->connected = FALSE;
+    mrcp_recog_header_t *recog_header = mrcp_resource_header_get(request);
+    
+    if (recog_header) {
+        /* Handle parameters */
+        if (mrcp_resource_header_property_check(request, RECOGNIZER_HEADER_CONFIDENCE_THRESHOLD) == TRUE) {
+            apt_log(RECOG_LOG_MARK, APT_PRIO_INFO, 
+                "Set Confidence Threshold: %.2f", recog_header->confidence_threshold);
+        }
+    }
+    
+    mrcp_engine_channel_message_send(channel, response);
+    return TRUE;
 }
 
-static apt_bool_t websocket_recog_msg_signal(websocket_recog_msg_type_e type, mrcp_engine_channel_t *channel, mrcp_message_t *request)
+static apt_bool_t websocket_recog_channel_get_params(
+    mrcp_engine_channel_t *channel,
+    mrcp_message_t *request,
+    mrcp_message_t *response)
 {
-	apt_bool_t status = FALSE;
-	websocket_recog_channel_t *demo_channel = channel->method_obj;
-	websocket_recog_engine_t *demo_engine = demo_channel->websocket_engine;
-	apt_task_t *task = apt_consumer_task_base_get(demo_engine->task);
-	apt_task_msg_t *msg = apt_task_msg_get(task);
-	if(msg) {
-		websocket_recog_msg_t *demo_msg;
-		msg->type = TASK_MSG_USER;
-		demo_msg = (websocket_recog_msg_t*) msg->data;
+    mrcp_recog_header_t *req_header = mrcp_resource_header_get(request);
+    
+    if (req_header) {
+        mrcp_recog_header_t *res_header = mrcp_resource_header_prepare(response);
+        if (mrcp_resource_header_property_check(request, RECOGNIZER_HEADER_CONFIDENCE_THRESHOLD) == TRUE) {
+            res_header->confidence_threshold = 0.5f;
+            mrcp_resource_header_property_add(response, RECOGNIZER_HEADER_CONFIDENCE_THRESHOLD);
+        }
+    }
+    
+    mrcp_engine_channel_message_send(channel, response);
+    return TRUE;
+}
 
-		demo_msg->type = type;
-		demo_msg->channel = channel;
-		demo_msg->request = request;
-		status = apt_task_msg_signal(task,msg);
-	}
-	return status;
+static apt_bool_t websocket_recog_channel_request_dispatch(mrcp_engine_channel_t *channel, mrcp_message_t *request)
+{
+    apt_bool_t processed = FALSE;
+    mrcp_message_t *response = mrcp_response_create(request, request->pool);
+    
+    switch (request->start_line.method_id) {
+        case RECOGNIZER_SET_PARAMS:
+            processed = websocket_recog_channel_set_params(channel, request, response);
+            break;
+        case RECOGNIZER_GET_PARAMS:
+            processed = websocket_recog_channel_get_params(channel, request, response);
+            break;
+        case RECOGNIZER_DEFINE_GRAMMAR:
+            /* Grammar handling - just accept for now */
+            mrcp_engine_channel_message_send(channel, response);
+            processed = TRUE;
+            break;
+        case RECOGNIZER_RECOGNIZE:
+            processed = websocket_recog_channel_recognize(channel, request, response);
+            break;
+        case RECOGNIZER_START_INPUT_TIMERS:
+            processed = websocket_recog_channel_timers_start(channel, request, response);
+            break;
+        case RECOGNIZER_STOP:
+            processed = websocket_recog_channel_stop(channel, request, response);
+            break;
+        default:
+            break;
+    }
+    
+    if (processed == FALSE) {
+        mrcp_engine_channel_message_send(channel, response);
+    }
+    return TRUE;
+}
+
+/*******************************************************************************
+ * Background Task Message Processing
+ ******************************************************************************/
+
+static apt_bool_t websocket_recog_msg_signal(
+    websocket_recog_msg_type_e type,
+    mrcp_engine_channel_t *channel,
+    mrcp_message_t *request)
+{
+    websocket_recog_channel_t *recog_channel = channel->method_obj;
+    websocket_recog_engine_t *recog_engine = recog_channel->recog_engine;
+    apt_task_t *task = apt_consumer_task_base_get(recog_engine->task);
+    apt_task_msg_t *msg = apt_task_msg_get(task);
+    
+    if (msg) {
+        websocket_recog_msg_t *recog_msg;
+        msg->type = TASK_MSG_USER;
+        recog_msg = (websocket_recog_msg_t*)msg->data;
+
+        recog_msg->type = type;
+        recog_msg->channel = channel;
+        recog_msg->request = request;
+        recog_msg->audio_data = NULL;
+        recog_msg->audio_len = 0;
+        return apt_task_msg_signal(task, msg);
+    }
+    return FALSE;
+}
+
+static apt_bool_t websocket_recog_msg_signal_audio(
+    mrcp_engine_channel_t *channel,
+    const char *data,
+    apr_size_t len)
+{
+    websocket_recog_channel_t *recog_channel = channel->method_obj;
+    websocket_recog_engine_t *recog_engine = recog_channel->recog_engine;
+    apt_task_t *task = apt_consumer_task_base_get(recog_engine->task);
+    apt_task_msg_t *msg = apt_task_msg_get(task);
+    
+    if (msg) {
+        websocket_recog_msg_t *recog_msg;
+        msg->type = TASK_MSG_USER;
+        recog_msg = (websocket_recog_msg_t*)msg->data;
+
+        recog_msg->type = WEBSOCKET_RECOG_MSG_STREAM_AUDIO;
+        recog_msg->channel = channel;
+        recog_msg->request = NULL;
+        recog_msg->audio_data = data;
+        recog_msg->audio_len = len;
+        return apt_task_msg_signal(task, msg);
+    }
+    return FALSE;
 }
 
 static apt_bool_t websocket_recog_msg_process(apt_task_t *task, apt_task_msg_t *msg)
 {
-	websocket_recog_msg_t *demo_msg = (websocket_recog_msg_t*)msg->data;
-	switch(demo_msg->type) {
-		case WEBSOCKET_RECOG_MSG_OPEN_CHANNEL:
-			/* open channel and send asynch response */
-			mrcp_engine_channel_open_respond(demo_msg->channel,TRUE);
-			break;
-		case WEBSOCKET_RECOG_MSG_CLOSE_CHANNEL:
-		{
-			/* close channel, make sure there is no activity and send asynch response */
-			websocket_recog_channel_t *recog_channel = demo_msg->channel->method_obj;
-			if(recog_channel->ws_client) {
-				websocket_client_destroy(recog_channel->ws_client);
-			}
-
-			mrcp_engine_channel_close_respond(demo_msg->channel);
-			break;
-		}
-		case WEBSOCKET_RECOG_MSG_REQUEST_PROCESS:
-			websocket_recog_channel_request_dispatch(demo_msg->channel,demo_msg->request);
-			break;
-		case WEBSOCKET_RECOG_MSG_SEND_AUDIO:
-		{
-			/* P1: Send audio data via WebSocket in background task (non-blocking) */
-			websocket_recog_channel_t *recog_channel = demo_msg->channel->method_obj;
-			if(recog_channel->ws_client && recog_channel->ws_client->connected && 
-			   recog_channel->audio_buffer_pos > 0) {
-				/* Send audio data via WebSocket */
-				if(websocket_client_send(recog_channel->ws_client, 
-										recog_channel->audio_buffer, 
-										recog_channel->audio_buffer_pos)) {
-					recog_channel->audio_buffer_pos = 0; /* Clear buffer after sending */
-					/* In a full implementation, we would wait for WebSocket response */
-					/* For now, simulate success */
-					websocket_recog_recognition_complete(recog_channel, RECOGNIZER_COMPLETION_CAUSE_SUCCESS);
-				} else {
-					apt_log(WEBSOCKET_RECOG_LOG_MARK,APT_PRIO_ERROR,"Failed to Send Audio Data via WebSocket");
-					websocket_recog_recognition_complete(recog_channel, RECOGNIZER_COMPLETION_CAUSE_ERROR);
-				}
-			}
-			break;
-		}
-		default:
-			break;
-	}
-	return TRUE;
+    websocket_recog_msg_t *recog_msg = (websocket_recog_msg_t*)msg->data;
+    websocket_recog_channel_t *recog_channel = recog_msg->channel->method_obj;
+    
+    switch (recog_msg->type) {
+        case WEBSOCKET_RECOG_MSG_OPEN_CHANNEL:
+            mrcp_engine_channel_open_respond(recog_msg->channel, TRUE);
+            break;
+            
+        case WEBSOCKET_RECOG_MSG_CLOSE_CHANNEL:
+            if (recog_channel->ws_client) {
+                ws_client_disconnect(recog_channel->ws_client, TRUE);
+            }
+            mrcp_engine_channel_close_respond(recog_msg->channel);
+            break;
+        
+        case WEBSOCKET_RECOG_MSG_REQUEST_PROCESS:
+            websocket_recog_channel_request_dispatch(recog_msg->channel, recog_msg->request);
+            break;
+            
+        case WEBSOCKET_RECOG_MSG_SEND_AUDIO:
+        {
+            /* Send all buffered audio to ASR server */
+            apr_thread_mutex_lock(recog_channel->mutex);
+            apr_size_t audio_len = recog_channel->audio_buffer_pos;
+            apr_thread_mutex_unlock(recog_channel->mutex);
+            
+            if (audio_len > 0 && ws_client_is_connected(recog_channel->ws_client)) {
+                apt_log(RECOG_LOG_MARK, APT_PRIO_INFO, 
+                    "Sending audio to ASR: %zu bytes", audio_len);
+                
+                if (ws_client_send_binary(recog_channel->ws_client, 
+                                          recog_channel->audio_buffer, audio_len)) {
+                    /* Wait for recognition result */
+                    recog_channel->waiting_result = TRUE;
+                    websocket_recog_msg_signal(WEBSOCKET_RECOG_MSG_RECV_RESULT, 
+                        recog_msg->channel, NULL);
+                } else {
+                    apt_log(RECOG_LOG_MARK, APT_PRIO_ERROR, "Failed to send audio");
+                    websocket_recog_recognition_complete(recog_channel, 
+                        RECOGNIZER_COMPLETION_CAUSE_ERROR, NULL);
+                }
+            } else {
+                websocket_recog_recognition_complete(recog_channel, 
+                    RECOGNIZER_COMPLETION_CAUSE_SUCCESS, NULL);
+            }
+            
+            /* Clear buffer */
+            apr_thread_mutex_lock(recog_channel->mutex);
+            recog_channel->audio_buffer_pos = 0;
+            recog_channel->stream_pos = 0;
+            apr_thread_mutex_unlock(recog_channel->mutex);
+            break;
+        }
+        
+        case WEBSOCKET_RECOG_MSG_STREAM_AUDIO:
+        {
+            /* Stream audio chunk to ASR server */
+            if (recog_msg->audio_data && recog_msg->audio_len > 0 &&
+                ws_client_is_connected(recog_channel->ws_client)) {
+                ws_client_send_binary(recog_channel->ws_client, 
+                    recog_msg->audio_data, recog_msg->audio_len);
+            }
+            break;
+        }
+        
+        case WEBSOCKET_RECOG_MSG_RECV_RESULT:
+        {
+            /* Poll for recognition result */
+            ws_frame_t frame;
+            
+            if (!recog_channel->waiting_result || !recog_channel->recog_request) {
+                break;
+            }
+            
+            /* Check timeout */
+            if (apr_time_now() - recog_channel->recognize_start_time > MAX_RECOGNIZE_DURATION) {
+                apt_log(RECOG_LOG_MARK, APT_PRIO_WARNING, "Recognition timeout");
+                websocket_recog_recognition_complete(recog_channel, 
+                    RECOGNIZER_COMPLETION_CAUSE_ERROR, NULL);
+                break;
+            }
+            
+            /* Try to receive result */
+            if (ws_client_receive_frame(recog_channel->ws_client, &frame)) {
+                if (frame.opcode == WS_OPCODE_TEXT && frame.payload_len > 0) {
+                    apt_log(RECOG_LOG_MARK, APT_PRIO_INFO, 
+                        "Recognition result: %s", frame.payload);
+                    websocket_recog_recognition_complete(recog_channel, 
+                        RECOGNIZER_COMPLETION_CAUSE_SUCCESS, frame.payload);
+                    break;
+                } else if (frame.opcode == WS_OPCODE_CLOSE) {
+                    websocket_recog_recognition_complete(recog_channel, 
+                        RECOGNIZER_COMPLETION_CAUSE_ERROR, NULL);
+                    break;
+                }
+            }
+            
+            /* Continue polling */
+            if (recog_channel->waiting_result) {
+                websocket_recog_msg_signal(WEBSOCKET_RECOG_MSG_RECV_RESULT, 
+                    recog_msg->channel, NULL);
+            }
+            break;
+        }
+        
+        default:
+            break;
+    }
+    
+    return TRUE;
 }
-

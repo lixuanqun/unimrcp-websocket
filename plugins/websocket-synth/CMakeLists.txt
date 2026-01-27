@@ -1,57 +1,46 @@
-cmake_minimum_required (VERSION 2.8)
-project (websocketsynth)
+# WebSocket Synthesizer Plugin
 
-# Set source files
-set (WEBSOCKET_SYNTH_SOURCES
-	src/websocket_synth_engine.c
-)
-source_group ("src" FILES ${WEBSOCKET_SYNTH_SOURCES})
+cmake_minimum_required(VERSION 3.0)
+project(websocketsynth C)
 
-# Plug-in declaration
-add_library (${PROJECT_NAME} MODULE ${WEBSOCKET_SYNTH_SOURCES}
-	$<TARGET_OBJECTS:mrcpengine>
-	$<TARGET_OBJECTS:mrcp>
-	$<TARGET_OBJECTS:mpf>
-	$<TARGET_OBJECTS:aprtoolkit>
-)
-set_target_properties (${PROJECT_NAME} PROPERTIES FOLDER "plugins")
-
-# Input libraries
-target_link_libraries(${PROJECT_NAME}
-	${APU_LIBRARIES}
-	${APR_LIBRARIES}
+# Source files
+set(WEBSOCKETSYNTH_SOURCES
+    src/websocket_synth_engine.c
 )
 
-# Input system libraries
-if (WIN32)
-	target_link_libraries(${PROJECT_NAME} ws2_32 winmm)
-elseif (UNIX)
-	target_link_libraries(${PROJECT_NAME} m pthread)
-endif ()
-
-# Preprocessor definitions
-add_definitions (
-	${MRCP_DEFINES}
-	${MPF_DEFINES}
-	${APR_TOOLKIT_DEFINES}
-	${APR_DEFINES}
-	${APU_DEFINES}
-)
+# Create plugin module
+add_library(websocketsynth MODULE ${WEBSOCKETSYNTH_SOURCES})
 
 # Include directories
-include_directories (
-	${PROJECT_SOURCE_DIR}/include
-	${MRCP_ENGINE_INCLUDE_DIRS}
-	${MRCP_INCLUDE_DIRS}
-	${MPF_INCLUDE_DIRS}
-	${APR_TOOLKIT_INCLUDE_DIRS}
-	${APR_INCLUDE_DIRS}
-	${APU_INCLUDE_DIRS}
+target_include_directories(websocketsynth PRIVATE
+    ${CMAKE_SOURCE_DIR}/libs/mrcp-engine/include
+    ${CMAKE_SOURCE_DIR}/libs/mrcp/include
+    ${CMAKE_SOURCE_DIR}/libs/mrcp/message/include
+    ${CMAKE_SOURCE_DIR}/libs/mrcp/control/include
+    ${CMAKE_SOURCE_DIR}/libs/mrcp/resources/include
+    ${CMAKE_SOURCE_DIR}/libs/mpf/include
+    ${CMAKE_SOURCE_DIR}/libs/apr-toolkit/include
+    ${CMAKE_SOURCE_DIR}/libs/websocket-client/include
 )
 
-# Installation directives
-install (TARGETS ${PROJECT_NAME} LIBRARY DESTINATION plugin)
-if (MSVC)
-	install (FILES ${PROJECT_BINARY_DIR}/Debug/${PROJECT_NAME}.pdb DESTINATION plugin CONFIGURATIONS Debug)
-	install (FILES ${PROJECT_BINARY_DIR}/RelWithDebInfo/${PROJECT_NAME}.pdb DESTINATION plugin CONFIGURATIONS RelWithDebInfo)
-endif (MSVC)
+# Link libraries
+target_link_libraries(websocketsynth
+    mrcpengine
+    mrcp
+    mpf
+    aprtoolkit
+    websocketclient
+    ${APR_LIBRARIES}
+    ${APRUtil_LIBRARIES}
+)
+
+# Set output properties
+set_target_properties(websocketsynth PROPERTIES
+    PREFIX ""
+    LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/plugins
+)
+
+# Install
+install(TARGETS websocketsynth
+    LIBRARY DESTINATION ${UNIMRCP_PLUGIN_DIR}
+)

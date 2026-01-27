@@ -105,6 +105,7 @@ endif ()
 if (ENABLE_SERVER_LIB)
 add_subdirectory (libs/mrcp-engine)
 add_subdirectory (libs/mrcp-server)
+add_subdirectory (libs/websocket-client)
 endif ()
 
 # Sub-projects: modules
