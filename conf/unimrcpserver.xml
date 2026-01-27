@@ -131,6 +131,12 @@
         <param name="ws-port" value="8080"/>
         <param name="ws-path" value="/asr"/>
       </engine>
+      <engine id="WebSocket-Synth-1" name="websocketsynth" enable="true">
+        <max-channel-count>100</max-channel-count>
+        <param name="ws-host" value="localhost"/>
+        <param name="ws-port" value="8080"/>
+        <param name="ws-path" value="/tts"/>
+      </engine>
 
       <!--
         Engines may have additional named ("max-channel-count") and generic (name/value) parameters.

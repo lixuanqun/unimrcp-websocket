@@ -15,6 +15,7 @@ option (ENABLE_DEMORECOG_PLUGIN    "Enable demo recognizer plugin"              
 option (ENABLE_DEMOVERIFIER_PLUGIN "Enable demo verifier plugin"                    ON)
 option (ENABLE_RECORDER_PLUGIN     "Enable recorder plugin"                         ON)
 option (ENABLE_WEBSOCKETRECOG_PLUGIN "Enable WebSocket recognizer plugin"           ON)
+option (ENABLE_WEBSOCKETSYNTH_PLUGIN "Enable WebSocket synthesizer plugin"          ON)
 
 option (ENABLE_AMR_CODEC           "Enable AMR Codec"                               OFF)
 
@@ -125,6 +126,9 @@ add_subdirectory (plugins/mrcp-recorder)
 endif ()
 if (ENABLE_WEBSOCKETRECOG_PLUGIN)
 add_subdirectory (plugins/websocket-recog)
+endif ()
+if (ENABLE_WEBSOCKETSYNTH_PLUGIN)
+add_subdirectory (plugins/websocket-synth)
 endif ()
 
 # Sub-projects: platform libraries

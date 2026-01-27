@@ -212,6 +212,11 @@ UNI_PLUGIN_ENABLED(websocketrecog)
 
 AM_CONDITIONAL([WEBSOCKETRECOG_PLUGIN],[test "${enable_websocketrecog_plugin}" = "yes"])
 
+dnl WebSocket synthesizer plugin.
+UNI_PLUGIN_ENABLED(websocketsynth)
+
+AM_CONDITIONAL([WEBSOCKETSYNTH_PLUGIN],[test "${enable_websocketsynth_plugin}" = "yes"])
+
 dnl Enable test suites.
 AC_ARG_ENABLE(test-suites,
     [AC_HELP_STRING([--enable-test-suites  ],[build test suites])],
@@ -242,6 +247,7 @@ AC_CONFIG_FILES([
     plugins/demo-synth/Makefile
     plugins/demo-recog/Makefile
     plugins/demo-verifier/Makefile
+    plugins/websocket-synth/Makefile
     platforms/Makefile
     platforms/libunimrcp-server/Makefile
     platforms/libunimrcp-client/Makefile
@@ -300,6 +306,7 @@ echo Demo recognizer plugin........ : $enable_demorecog_plugin
 echo Demo verifier plugin.......... : $enable_demoverifier_plugin
 echo Recorder plugin............... : $enable_recorder_plugin
 echo WebSocket recognizer plugin... : $enable_websocketrecog_plugin
+echo WebSocket synthesizer plugin.. : $enable_websocketsynth_plugin
 echo
 echo Installation layout........... : $layout_name
 echo Installation directory........ : $prefix

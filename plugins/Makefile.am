@@ -21,3 +21,7 @@ endif
 if WEBSOCKETRECOG_PLUGIN
 SUBDIRS               += websocket-recog
 endif
+
+if WEBSOCKETSYNTH_PLUGIN
+SUBDIRS               += websocket-synth
+endif
