@@ -239,6 +239,7 @@ static mrcp_engine_channel_t* websocket_recog_engine_channel_create(mrcp_engine_
 	recog_channel->websocket_engine = engine->obj;
 	recog_channel->recog_request = NULL;
 	recog_channel->stop_response = NULL;
+	recog_channel->timers_started = FALSE;
 	recog_channel->detector = mpf_activity_detector_create(pool);
 	recog_channel->ws_client = NULL;
 	recog_channel->audio_buffer = NULL;
@@ -642,17 +643,19 @@ static apt_bool_t websocket_client_connect(websocket_client_t *ws_client)
 	}
 
 	/* P2: Generate random WebSocket key (16 bytes, Base64 encoded) */
-	unsigned char random_key[16];
-	apr_uuid_t uuid;
-	apr_uuid_get(&uuid);
-	/* Use UUID as random source (16 bytes) */
-	memcpy(random_key, uuid.data, 16);
-	
-	/* Base64 encode */
-	char *key_buf = apr_palloc(ws_client->pool, apr_base64_encode_len(16) + 1);
-	apr_size_t encoded_len = apr_base64_encode(key_buf, (char*)random_key, 16);
-	key_buf[encoded_len] = '\0';
-	key = key_buf;
+	{
+		unsigned char random_key[16];
+		apr_uuid_t uuid;
+		char *key_buf;
+		apr_uuid_get(&uuid);
+		/* Use UUID as random source (16 bytes) */
+		memcpy(random_key, uuid.data, 16);
+		
+		/* Base64 encode */
+		key_buf = apr_palloc(ws_client->pool, apr_base64_encode_len(16) + 1);
+		apr_base64_encode(key_buf, (char*)random_key, 16);
+		key = key_buf;
+	}
 
 	/* Send WebSocket handshake */
 	host_header = apr_psprintf(ws_client->pool, "%s:%d", ws_client->host, ws_client->port);
@@ -787,8 +790,103 @@ static apt_bool_t websocket_client_send(websocket_client_t *ws_client, const cha
 
 static apt_bool_t websocket_client_receive(websocket_client_t *ws_client, char *buffer, apr_size_t *len)
 {
-	/* Simplified - in production implement full WebSocket frame parsing */
-	return FALSE;
+	apr_status_t rv;
+	unsigned char header[14];
+	apr_size_t header_len;
+	apr_size_t payload_len;
+	unsigned char opcode;
+	apt_bool_t fin;
+	apr_size_t received;
+	apr_size_t remaining;
+	apr_size_t max_len;
+
+	if(!ws_client->connected || !ws_client->socket || !buffer || !len) {
+		return FALSE;
+	}
+
+	max_len = *len;
+	*len = 0;
+
+	/* Set socket timeout for receive */
+	apr_socket_timeout_set(ws_client->socket, 5 * 1000000); /* 5 seconds */
+
+	/* Read frame header (at least 2 bytes) */
+	header_len = 2;
+	rv = apr_socket_recv(ws_client->socket, (char*)header, &header_len);
+	if(rv != APR_SUCCESS || header_len < 2) {
+		apt_log(WEBSOCKET_RECOG_LOG_MARK,APT_PRIO_DEBUG,"WebSocket receive timeout or error");
+		return FALSE;
+	}
+
+	fin = (header[0] & 0x80) != 0;
+	opcode = header[0] & 0x0F;
+	payload_len = header[1] & 0x7F;
+
+	/* Extended payload length */
+	if(payload_len == 126) {
+		header_len = 2;
+		rv = apr_socket_recv(ws_client->socket, (char*)&header[2], &header_len);
+		if(rv != APR_SUCCESS || header_len < 2) {
+			return FALSE;
+		}
+		payload_len = ((apr_size_t)header[2] << 8) | header[3];
+	} else if(payload_len == 127) {
+		header_len = 8;
+		rv = apr_socket_recv(ws_client->socket, (char*)&header[2], &header_len);
+		if(rv != APR_SUCCESS || header_len < 8) {
+			return FALSE;
+		}
+		payload_len = ((apr_size_t)header[6] << 24) | ((apr_size_t)header[7] << 16) |
+		              ((apr_size_t)header[8] << 8) | header[9];
+	}
+
+	/* Handle close frame */
+	if(opcode == 0x08) {
+		apt_log(WEBSOCKET_RECOG_LOG_MARK,APT_PRIO_INFO,"WebSocket close frame received");
+		ws_client->connected = FALSE;
+		return FALSE;
+	}
+
+	/* Handle ping frame */
+	if(opcode == 0x09) {
+		/* Send pong response */
+		unsigned char pong[2] = {0x8A, 0x00};
+		apr_size_t pong_len = 2;
+		apr_socket_send(ws_client->socket, (char*)pong, &pong_len);
+		*len = 0;
+		return TRUE;
+	}
+
+	/* Read payload (text or binary frame) */
+	if(payload_len > 0 && (opcode == 0x01 || opcode == 0x02)) {
+		apr_size_t to_read = (payload_len < max_len) ? payload_len : max_len;
+		received = 0;
+		while(received < to_read) {
+			remaining = to_read - received;
+			rv = apr_socket_recv(ws_client->socket, buffer + received, &remaining);
+			if(rv != APR_SUCCESS) {
+				return FALSE;
+			}
+			received += remaining;
+		}
+		*len = received;
+		
+		/* If we couldn't read the full payload, discard the rest */
+		if(payload_len > max_len) {
+			char discard[1024];
+			apr_size_t discard_remaining = payload_len - max_len;
+			while(discard_remaining > 0) {
+				apr_size_t chunk = (discard_remaining < sizeof(discard)) ? discard_remaining : sizeof(discard);
+				rv = apr_socket_recv(ws_client->socket, discard, &chunk);
+				if(rv != APR_SUCCESS) break;
+				discard_remaining -= chunk;
+			}
+		}
+		
+		return TRUE;
+	}
+
+	return TRUE;
 }
 
 static void websocket_client_destroy(websocket_client_t *ws_client)

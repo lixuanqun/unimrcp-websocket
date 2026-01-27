@@ -402,6 +402,68 @@ static apt_bool_t websocket_synth_channel_request_process(mrcp_engine_channel_t 
  * Final message: JSON with {"status": "complete"} or audio stream end
  ******************************************************************************/
 
+/** Escape string for JSON (handles special characters) */
+static char* json_escape_string(const char *str, apr_pool_t *pool)
+{
+	apr_size_t len;
+	apr_size_t i, j;
+	char *escaped;
+	apr_size_t escaped_len;
+	
+	if (!str) {
+		return apr_pstrdup(pool, "");
+	}
+	
+	len = strlen(str);
+	/* Worst case: every character needs escaping (6 chars for \uXXXX) */
+	escaped = apr_palloc(pool, len * 6 + 1);
+	
+	for (i = 0, j = 0; i < len; i++) {
+		unsigned char c = (unsigned char)str[i];
+		switch (c) {
+			case '"':
+				escaped[j++] = '\\';
+				escaped[j++] = '"';
+				break;
+			case '\\':
+				escaped[j++] = '\\';
+				escaped[j++] = '\\';
+				break;
+			case '\b':
+				escaped[j++] = '\\';
+				escaped[j++] = 'b';
+				break;
+			case '\f':
+				escaped[j++] = '\\';
+				escaped[j++] = 'f';
+				break;
+			case '\n':
+				escaped[j++] = '\\';
+				escaped[j++] = 'n';
+				break;
+			case '\r':
+				escaped[j++] = '\\';
+				escaped[j++] = 'r';
+				break;
+			case '\t':
+				escaped[j++] = '\\';
+				escaped[j++] = 't';
+				break;
+			default:
+				if (c < 32) {
+					/* Control character - escape as \u00XX */
+					j += apr_snprintf(escaped + j, 7, "\\u%04x", c);
+				} else {
+					escaped[j++] = c;
+				}
+				break;
+		}
+	}
+	escaped[j] = '\0';
+	
+	return escaped;
+}
+
 /** Build TTS request JSON */
 static char* websocket_synth_build_request_json(
 	websocket_synth_channel_t *synth_channel,
@@ -462,21 +524,26 @@ static char* websocket_synth_build_request_json(
 		session_id = request->channel_id.session_id.buf;
 	}
 
-	/* Build JSON request
-	 * Note: In production, should use proper JSON library for escaping */
-	json = apr_psprintf(pool,
-		"{"
-		"\"action\":\"tts\","
-		"\"text\":\"%s\","
-		"\"voice\":\"%s\","
-		"\"speed\":%.2f,"
-		"\"pitch\":%.2f,"
-		"\"volume\":%.2f,"
-		"\"sample_rate\":%d,"
-		"\"format\":\"pcm\","
-		"\"session_id\":\"%s\""
-		"}",
-		text, voice_name, speed, pitch, volume, sample_rate, session_id);
+	/* Build JSON request with properly escaped strings */
+	{
+		const char *escaped_text = json_escape_string(text, pool);
+		const char *escaped_voice = json_escape_string(voice_name, pool);
+		const char *escaped_session = json_escape_string(session_id, pool);
+		
+		json = apr_psprintf(pool,
+			"{"
+			"\"action\":\"tts\","
+			"\"text\":\"%s\","
+			"\"voice\":\"%s\","
+			"\"speed\":%.2f,"
+			"\"pitch\":%.2f,"
+			"\"volume\":%.2f,"
+			"\"sample_rate\":%d,"
+			"\"format\":\"pcm\","
+			"\"session_id\":\"%s\""
+			"}",
+			escaped_text, escaped_voice, speed, pitch, volume, sample_rate, escaped_session);
+	}
 
 	apt_log(WEBSOCKET_SYNTH_LOG_MARK, APT_PRIO_DEBUG, "TTS Request JSON: %s", json);
 	return json;
