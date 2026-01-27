@@ -1,0 +1,12 @@
+{
+  "name": "unimrcp-websocket-server",
+  "version": "1.0.0",
+  "description": "UniMRCP WebSocket TTS/ASR 服务示例",
+  "main": "websocket_server.js",
+  "scripts": {
+    "start": "node websocket_server.js"
+  },
+  "dependencies": {
+    "ws": "^8.0.0"
+  }
+}
