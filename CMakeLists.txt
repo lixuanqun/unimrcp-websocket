@@ -36,6 +36,10 @@ set (CMAKE_MODULE_PATH ${CMAKE_MODULE_PATH} ${CMAKE_SOURCE_DIR}/build/cmake)
 find_package (APR REQUIRED)
 find_package (APRUtil REQUIRED)
 find_package (Sofia REQUIRED)
+
+# Set SOFIA variables for submodules compatibility
+set (SOFIA_INCLUDE_DIRS ${Sofia_INCLUDE_DIRS})
+set (SOFIA_LIBRARIES ${Sofia_LIBRARIES})
 if (ENABLE_AMR_CODEC)
 	find_package (OpenCoreAMR REQUIRED)
 	find_package (VoAMRWBEnc REQUIRED)

@@ -27,6 +27,7 @@
  * 5. Methods (callbacks) of the MPF engine stream MUST not block.
  */
 
+#include <stdlib.h>
 #include "mrcp_synth_engine.h"
 #include "apt_consumer_task.h"
 #include "apt_log.h"

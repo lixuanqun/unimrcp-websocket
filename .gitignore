@@ -398,6 +398,7 @@ build/modules/
 build/platforms/
 build/plugins/
 build/tests/
+build/cmake_install.cmake
 *.o
 *.so
 *.a
