@@ -18,7 +18,7 @@ set_target_properties (${PROJECT_NAME} PROPERTIES FOLDER "tests")
 
 # Input libraries
 target_link_libraries(${PROJECT_NAME} 
-	${APU_LIBRARIES}
+	${APRUtil_LIBRARIES}
 	${APR_LIBRARIES}
 )
 # Input system libraries
@@ -40,5 +40,5 @@ include_directories (
 	${PROJECT_SOURCE_DIR}/include
 	${APR_TOOLKIT_INCLUDE_DIRS}
 	${APR_INCLUDE_DIRS}
-	${APU_INCLUDE_DIRS}
+	${APRUtil_INCLUDE_DIRS}
 )

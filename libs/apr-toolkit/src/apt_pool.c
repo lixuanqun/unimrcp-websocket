@@ -38,7 +38,9 @@ APT_DECLARE(apr_pool_t*) apt_pool_create()
 			apr_allocator_owner_set(allocator,pool);
 			apr_thread_mutex_create(&mutex,APR_THREAD_MUTEX_NESTED,pool);
 			apr_allocator_mutex_set(allocator,mutex);
+#if APR_MAJOR_VERSION > 1 || (APR_MAJOR_VERSION == 1 && APR_MINOR_VERSION >= 6)
 			apr_pool_mutex_set(pool,mutex); 
+#endif
 		}
 	}
 #else

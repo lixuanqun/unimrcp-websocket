@@ -20,6 +20,8 @@ add_library(websocketclient STATIC ${WEBSOCKETCLIENT_SOURCES})
 target_include_directories(websocketclient PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/include
     ${CMAKE_SOURCE_DIR}/libs/apr-toolkit/include
+    ${APR_INCLUDE_DIRS}
+    ${APRUtil_INCLUDE_DIRS}
 )
 
 # Link dependencies

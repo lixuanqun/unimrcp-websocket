@@ -18,7 +18,7 @@ set_target_properties (${PROJECT_NAME} PROPERTIES FOLDER "plugins")
 
 # Input libraries
 target_link_libraries(${PROJECT_NAME} 
-	${APU_LIBRARIES}
+	${APRUtil_LIBRARIES}
 	${APR_LIBRARIES}
 )
 # Input system libraries
@@ -45,7 +45,7 @@ include_directories (
 	${MPF_INCLUDE_DIRS}
 	${APR_TOOLKIT_INCLUDE_DIRS}
 	${APR_INCLUDE_DIRS}
-	${APU_INCLUDE_DIRS}
+	${APRUtil_INCLUDE_DIRS}
 )
 
 # Installation directives

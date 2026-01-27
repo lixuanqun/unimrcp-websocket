@@ -22,9 +22,11 @@
  * @brief WebSocket client library for UniMRCP plugins
  */
 
+#include <apr.h>
 #include <apr_pools.h>
 #include <apr_network_io.h>
 #include <apr_thread_mutex.h>
+#include <apr_poll.h>
 #include "apt_log.h"
 
 APT_BEGIN_EXTERN_C

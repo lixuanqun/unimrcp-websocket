@@ -553,7 +553,6 @@ static char* websocket_synth_build_request_json(
     const char *text = NULL;
     const char *voice_name = "default";
     float speed = 1.0f;
-    float pitch = 1.0f;
     float volume = 1.0f;
     int sample_rate = 8000;
     const char *session_id = "";
@@ -579,9 +578,6 @@ static char* websocket_synth_build_request_json(
         }
         if (mrcp_resource_header_property_check(request, SYNTHESIZER_HEADER_PROSODY_RATE) == TRUE) {
             speed = synth_header->prosody_param.rate.value.relative;
-        }
-        if (mrcp_resource_header_property_check(request, SYNTHESIZER_HEADER_PROSODY_PITCH) == TRUE) {
-            pitch = synth_header->prosody_param.pitch.value.relative;
         }
         if (mrcp_resource_header_property_check(request, SYNTHESIZER_HEADER_PROSODY_VOLUME) == TRUE) {
             volume = synth_header->prosody_param.volume.value.relative;
@@ -615,13 +611,12 @@ static char* websocket_synth_build_request_json(
             "\"text\":\"%s\","
             "\"voice\":\"%s\","
             "\"speed\":%.2f,"
-            "\"pitch\":%.2f,"
             "\"volume\":%.2f,"
             "\"sample_rate\":%d,"
             "\"format\":\"pcm\","
             "\"session_id\":\"%s\""
             "}",
-            escaped_text, escaped_voice, speed, pitch, volume, sample_rate, escaped_session);
+            escaped_text, escaped_voice, speed, volume, sample_rate, escaped_session);
     }
 
     apt_log(SYNTH_LOG_MARK, APT_PRIO_DEBUG, "TTS Request: %s", json);

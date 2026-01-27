@@ -42,5 +42,5 @@ set_target_properties(websocketsynth PROPERTIES
 
 # Install
 install(TARGETS websocketsynth
-    LIBRARY DESTINATION ${UNIMRCP_PLUGIN_DIR}
+    LIBRARY DESTINATION lib/unimrcp
 )

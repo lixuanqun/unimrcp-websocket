@@ -42,5 +42,5 @@ set_target_properties(websocketrecog PROPERTIES
 
 # Install
 install(TARGETS websocketrecog
-    LIBRARY DESTINATION ${UNIMRCP_PLUGIN_DIR}
+    LIBRARY DESTINATION lib/unimrcp
 )

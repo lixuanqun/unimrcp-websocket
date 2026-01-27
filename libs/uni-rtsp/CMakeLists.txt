@@ -41,5 +41,5 @@ include_directories (
 	${PROJECT_SOURCE_DIR}/include
 	${APR_TOOLKIT_INCLUDE_DIRS}
 	${APR_INCLUDE_DIRS}
-	${APU_INCLUDE_DIRS}
+	${APRUtil_INCLUDE_DIRS}
 )
