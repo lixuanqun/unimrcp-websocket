@@ -540,6 +540,8 @@ static apt_bool_t websocket_synth_stream_read(mpf_audio_stream_t *stream, mpf_fr
     return TRUE;
 }
 
+#include "ws_json_escape.c"
+
 /*******************************************************************************
  * TTS Request Processing
  ******************************************************************************/
